@@ -19,6 +19,7 @@
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
+import random
 import socket
 import threading
 import queue
@@ -31,6 +32,12 @@ import signal
 from datetime import datetime
 import bisect 
 import struct
+import ysffich
+import ysfpayload
+import ysfutils
+import gps
+import ysfaprs
+import json
 
 
 def ip2long(ip):
@@ -94,8 +101,11 @@ def check_string(l):
 
 def RecvData(sock,recvPackets):
     while True:
-        data,addr = sock.recvfrom(1024)    # block if I don't receive anything 
-        recvPackets.put((data,addr))
+        try:
+          data,addr = sock.recvfrom(2048)    # block if I don't receive anything 
+          recvPackets.put((data,addr))
+        except:
+          printlog(1, 'Error in RecvData') 
         
 
 def CalcID(ref):
@@ -124,37 +134,67 @@ def getidgw(cl, adr):
   return i
 
         
-def ElencoNodi(cl):
+def ElencoNodi(cl,qjs):
+  global SCHED
   while True:
     time.sleep(120)
+    n_r = 0
     cl_lo = []
     if (len(cl) == 0):
       printlog(1, 'No repeaters/gateways linked')
+      qjs.put('{"linked": "0"}')
     else:
       printlog(1, 'Currently linked repeaters/gateways:')
       for c in cl:
+        n_r += 1
         printlog(1, '     ' + c[2].ljust(10) + ': ' + str(c[0]) + ':' + str(c[1]) + ' ' + str(c[3]) + '/60 : ' + datetime.utcfromtimestamp(c[6]).strftime("%Y-%m-%d %H:%M:%S"))
+        sjson = '{"linked": "' + str(n_r) + '", "call": "' + c[2] + '", "IP": "' + str(c[0]) + '", "port": "' + str(c[1]) +'", "TC": "' + str(c[3]) + '", "CF": "' + datetime.utcfromtimestamp(c[6]).strftime("%Y-%m-%d %H:%M:%S") + '", "LO": "' + str(c[5]) + '", "LK": "' + str(c[7]) + '"}'
+        qjs.put(sjson)
         if (c[5] == 1):
           cl_lo.append(c)
+      sjson = '{"total_linked": "' + str(n_r) + '"}'
+      qjs.put(sjson)
       if (len(cl_lo) == 0):
         printlog(1, 'No repeaters/gateways muted')
       else:
         printlog(1, 'Currently muted repeaters/gateways:')
+        n_r = 0
         for c in cl_lo:
-          printlog(1, '     ' + c[2].ljust(10) + ': ' + str(c[0]) + ':' + str(c[1]) + ' ' + str(c[3]) + '/60')     
+          n_r += 1
+          printlog(1, '     ' + c[2].ljust(10) + ': ' + str(c[0]) + ':' + str(c[1]) + ' ' + str(c[3]) + '/60')    
+    n_r = 0
+    for c in SCHED:
+      n_r += 1
+      sjson = '{"blk_time": "' + str(n_r) + '", "call": "' + c[0] + '", "BR": "' + c[1] + '", "TR": "' + datetime.utcfromtimestamp(c[2]).strftime("%Y-%m-%d %H:%M:%S") + '"}'  
+      qjs.put(sjson)
+    sjson = '{"total_blk_time": "' + str(n_r) + '"}'
+    qjs.put(sjson)
 
 
 def TimeoutNodi(cl):
+  global lock_nodi
   while True:
     time.sleep(1)
     for c in cl:
+      lock_nodi.acquire()
       c[3] += 1
+      lock_nodi.release()
       if (c[3] > 60):
         printlog(1, 'Removing ' + c[2].ljust(10) + ' (' + c[0] + ':' + str(c[1]) + ') disappeared')
         cl.remove(c)
 
+def TimeoutNodiJS(cl):
+  while True:
+    time.sleep(1)
+    for c in cl:
+      c[2] += 1
+      if (c[2] > 60):
+        printlog(1, 'Removing json client ' + c[0] + ':' + str(c[1]) + ' disappeared')
+        cl.remove(c)
 
-def TimeoutTX(t, t_lock, r_lock, lista_lh, lista_lhd, t_out, t_react):
+
+
+def TimeoutTX(t, t_lock, r_lock, lista_lh, lista_lhd, t_out, t_react, jsmess):
   global BLK_TMP
   global SCHED
   global lock_tx
@@ -163,10 +203,12 @@ def TimeoutTX(t, t_lock, r_lock, lista_lh, lista_lhd, t_out, t_react):
       lock_tx.acquire()
       t[1] += 0.1
       lock_tx.release()
-    if ((t[1] > 1.5) and (t[0] != 0)):
+    if ((t[1] > 2.0) and (t[0] != 0)):
+      gps.gps_reset()
       lock_tx.acquire()
       t[0] = 0  
-      printlog(1, 'Network watchdog has expired')
+      printlog(1, 'Network watchdog has expired coords: ' + "{:.6f}".format(t[7]) + ', ' + "{:.6f}".format(t[8]) + ' | ' + str(t[9]) + '/' + str(t[9] - t[10]) + ' <' + str(t[5]).zfill(7) + '>')
+      jsmess.put('{"stream_end": "' + str(t[5]).zfill(7) + '", "type": "WD", "time": "' +  str(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
       inserisci_lista(lista_lh, [check_string(t[2]), check_string(t[3]), check_string(t[4]), t[5], datetime.utcfromtimestamp(t[6]).strftime("%d-%m-%Y %H-%M-%S"), round(time.time() - t[6]) ], 20)
       inserisci_listaD(lista_lhd, [check_string(t[2]), check_string(t[3]), check_string(t[4]), t[5], datetime.utcfromtimestamp(t[6]).strftime("%d-%m-%Y %H-%M-%S"), round(time.time() - t[6]) ], 20)
       t[1] = 0
@@ -175,12 +217,16 @@ def TimeoutTX(t, t_lock, r_lock, lista_lh, lista_lhd, t_out, t_react):
       t[4] = ''
       t[5] = 0
       t[6] = 0
+      t[7] = 999.0
+      t[8] = 999.0
+      t[9] = 0
+      t[10] = 0
       lock_tx.release()
     pop_list = []  
     for d in t_lock:
       if (t_lock[d] < 5):
         t_lock[d] += 0.1
-      if ((t_lock[d] > 2.0) and (t_lock[d] != 0)):    
+      if ((t_lock[d] > 1.5) and (t_lock[d] != 0)):    
         pop_list.append(d)
         r_lock.remove(d)
         
@@ -194,8 +240,9 @@ def TimeoutTX(t, t_lock, r_lock, lista_lh, lista_lhd, t_out, t_react):
         printlog(1, 'Timeout ' + t[3])
         t[0] = 0                          # drop transmission/force reauthorisation
         t_sched =  time.time() + t_react
-        SCHED.append([t[3], 'RC', t_sched])       # append scheduled remove from blocked list
+        SCHED.append([t[3], 'RCT', t_sched])       # append scheduled remove from blocked list
         printlog(1, 'Appended scheduled job: ' + t[3] + '/RC at time '  + time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(t_sched))) 
+        jsmess.put('{"stream_timeout": "' +  str(t[5]).zfill(7) + '", "CS": "' + t[3] + '", "time": "' +  str(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
     time.sleep(0.1)  
 
 def scheduler():
@@ -206,14 +253,14 @@ def scheduler():
     t = time.time()
     for sc in SCHED:
       if (t > sc[2]):
-        if (sc[1] == 'RC'):
+        if ((sc[1] == 'RCT') or (sc[1] == 'RCW')):
           BLK_TMP.remove(sc[0])
           SCHED.remove(sc)
           printlog(1, 'Removed from temporary blockeds queue ' + sc[0]) 
   
 
 
-def ckeck_wild_ptt(cs, tw, cnt, trea):
+def ckeck_wild_ptt(cs, tw, cnt, trea, jsmess):
   global W_PTT
   global BLK_TMP
   n = 0
@@ -229,20 +276,23 @@ def ckeck_wild_ptt(cs, tw, cnt, trea):
     printlog(1, 'Wild-PTT ' + r[0])
     if (not inlist(BLK_TMP, r[0])):
         bisect.insort(BLK_TMP,r[0])  
-        SCHED.append([r[0], 'RC', tc + trea])
+        SCHED.append([r[0], 'RCW', tc + trea])
         printlog(1, 'Appended scheduled job: ' + r[0] + '/RC at time '  + time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(tc + trea)))
-
+        # jsmess.put('{"wild_ptt": "-1", "CS": "' + r[0] + '", "TR": "' + time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(tc + trea)) + '"}')
+  
   
 def canTrasmit(cs, re_en):
   global BLACK_LIST
   global WHITE_LIST
   global BLK_TMP
+  global SUF_BL
+
   call_sp = re.split(r'[-/\' \']', cs)
   call = call_sp[0]
   
-## always block a stream from repeater ###
+## always block a stream from repeater/node/gateway ###
   if (len(call_sp) > 1):
-    if (call_sp[1] == 'RPT'):
+    if inlist(SUF_BL, call_sp[1]):
       return False      
   
   if inlist(BLK_TMP, call):
@@ -312,7 +362,9 @@ def blacklist(f_bl, t_reload, cli):
   global GW_BL
   global IP_BL
   global GW_LK
-  global IP_LK  
+  global IP_LK 
+  global SUF_BL
+  global SN_BL 
 
   f_time_old = 0
   try:
@@ -331,6 +383,8 @@ def blacklist(f_bl, t_reload, cli):
         WL_TMP = []
         GW_LK_TMP = []
         IP_LK_TMP = []
+        SUF_BL_TMP = []
+        SN_BL_TMP = []
         printlog(1, 'Reload the Blacklist from File')
         for row in file:
           content = row.strip()
@@ -364,7 +418,17 @@ def blacklist(f_bl, t_reload, cli):
             # GWB      
             if (len(c_split) == 2 and c_split[0] == 'GWB'):      
               if (not inlist(GW_LK_TMP, c_split[1])):
-                bisect.insort(GW_LK_TMP,c_split[1])                
+                bisect.insort(GW_LK_TMP,c_split[1])              
+           
+           # SUF      
+            if (len(c_split) == 2 and c_split[0] == 'SB'):      
+              if (not inlist(SUF_BL_TMP, c_split[1])):
+                bisect.insort(SUF_BL_TMP,c_split[1])       
+           
+           # SN      
+            if (len(c_split) == 2 and c_split[0] == 'SN' and len(c_split[1]) == 5):      
+              if (not inlist(SN_BL_TMP, c_split[1])):
+                bisect.insort(SN_BL_TMP,c_split[1])       
                 
             # IP      
             if (len(c_split) == 2 and c_split[0] == 'IP'):      
@@ -399,7 +463,9 @@ def blacklist(f_bl, t_reload, cli):
       IP_BL = IP_TMP.copy()
       GW_LK = GW_LK_TMP.copy()
       IP_LK = IP_LK_TMP.copy()
-      printlog(1, 'Loaded ' + str(len(BLACK_LIST)) + '/CS ' + str(len(WHITE_LIST)) + '/AL ' + str(len(GW_BL)) + '/GW ' + str(len(IP_BL)) + '/IP ' + str(len(GW_LK)) + '/GWB ' + str(len(IP_LK)) + '/IPB')
+      SUF_BL = SUF_BL_TMP.copy()
+      SN_BL = SN_BL_TMP.copy()
+      printlog(1, 'Loaded ' + str(len(BLACK_LIST)) + '/CS ' + str(len(WHITE_LIST)) + '/AL ' + str(len(GW_BL)) + '/GW ' + str(len(IP_BL)) + '/IP ' + str(len(GW_LK)) + '/GWB ' + str(len(IP_LK)) + '/IPB ' + str(len(SUF_BL)) + '/SB ' + str(len(SN_BL)) + '/SN')
       f_time_old = f_time
       update_clients(cli)
     else:
@@ -419,6 +485,16 @@ def ReadConfig(f,p):
     id = int(config['Info']['id'])
   except:
     id = 0
+  try:
+    contact = config['Info']['Contact']
+  except:
+    contact = ''
+    
+  try:
+    web = config['Info']['Web']
+  except:
+    web = ''
+    
   log_path = config['Log']['FilePath']
   log_name = config['Log']['FileRoot']
   try:
@@ -440,13 +516,27 @@ def ReadConfig(f,p):
     en_ext_cmd = int(config['Log']['EnableExtendedCommands'])
   except:
     en_ext_cmd = 0 # extended commands disabled by default
-
-
-  
+ 
   try:
     port = int(config['Network']['Port'])
   except:
     port = 42000
+      
+  try:
+    IP = config['Network']['IP']
+  except:
+    IP = '0.0.0.0'
+    
+  try:
+    json_port = int(config['Network']['Json_Port'])
+  except:
+    json_port = port + 1
+    
+  try:
+    json_IP = config['Network']['Json_IP']
+  except:
+    json_IP = '127.0.0.1'
+    
   try:  
     file_blacklist = config['Block List']['File']
   except:
@@ -487,17 +577,36 @@ def ReadConfig(f,p):
   except:
     treactivate = 1800.0  
   
-  
   try:
     wildptttime = float(config['Protections']['WildPTTTime'])
   except:
     wildptttime = 5.0  
       
-  
   try:
     wildpttcount = int(config['Protections']['WildPTTCount'])
   except:
     wildpttcount = 3  
+
+  try:
+    aprs_en = int(config['APRS']['enable'])
+    if (aprs_en >= 1):
+      aprs_en = 1
+    if (aprs_en < 1):
+      aprs_en = 0
+  except:
+    aprs_en = 0
+
+  aprs_server = config['APRS']['server']
+
+  try:
+    aprs_port = int(config['APRS']['port'])
+  except:
+    aprs_port = 14580
+    
+  aprs_ssid = config['APRS']['ssid']   
+  
+  if (aprs_ssid == '-0'):
+    aprs_ssid = ''   
 
   p.append(id)                 # 0
   p.append(name)               # 1
@@ -517,8 +626,16 @@ def ReadConfig(f,p):
   p.append(treactivate)        #15
   p.append(wildptttime)        #16
   p.append(wildpttcount)       #17
-
-
+  p.append(aprs_en)            #18
+  p.append(aprs_server)        #19
+  p.append(aprs_port)          #20
+  p.append(aprs_ssid)          #21
+  p.append(IP)                 #22
+  p.append(json_IP)            #23
+  p.append(json_port)          #24  
+  p.append(contact)            #25  
+  p.append(web)                #26  
+  
     
 def sanitize_msg(data):
   bya_msg = bytearray(data)
@@ -534,7 +651,75 @@ def sanitize_msg(data):
         bya_msg[i+4] = 32
 
   return(bytes(bya_msg))
-  
+
+
+def aprs_send_data(server, user, port):
+  global APRS_STR
+  while True:
+    s = APRS_STR.get()
+    printlog(1, 'APRS string: ' + s)
+    try:
+      ysfaprs.send_aprs(s, server, user, port)
+    except:
+      printlog(1, 'Impossible to send APRS data')
+    
+    time.sleep(5.0)
+
+def json_send(q,s,cl): #queue, socket, clients
+  while True:
+    try:                                       
+      mess = q.get()
+      for c in cl:
+        # printlog(1, 'send ' + mess + ' at ' + str(c[0]) + ':' + str(c[1])) 
+        s.sendto(str.encode(mess), (c[0], c[1])) 
+    except Exception as e:
+      printlog(1, 'Error in json_send ' + str(e))        
+            
+def json_recv(q,s,cl):
+  global version
+  global refl_id
+  global refl_name
+  global refl_desc
+  global aprs_en
+  global aprs_ssid
+  global refl_contact
+  global refl_web
+    
+  while True:
+    try:
+      data,addr = s.recvfrom(1024)    
+      if (data == b'CONNREQ'):
+        pres = False
+        for c in cl:
+          if ((c[0] == addr[0]) and (c[1] == addr[1])):
+            pres = True
+            break   
+        if (not pres):
+          cl.append([addr[0], addr[1], 0])
+          printlog(1, 'added json client: ' + str(addr)) 
+          connstr = 'CONNOK:' + str(addr[0]) + ':' + str(addr[1]) 
+          s.sendto(str.encode(connstr), addr)
+          q.put('{"system": "pYSFReflector2", "ver": "' + version + '", "REF_ID": "' + str(refl_id).zfill(5) + '", "REF_NAME": "' + refl_name + '", "REF_DESC": "' + refl_desc + '", "APRS_EN": "' + str(aprs_en) + '", "APRS_SSID": "' + aprs_ssid + '", "contact": "' + refl_contact + '", "web": "' + refl_web + '"}')
+      if (data == b'PING'):  
+        for c in cl:
+          if ((c[0] == addr[0]) and (c[1] == addr[1])):
+            s.sendto(b'PONG', addr)
+            # printlog(1, 'PING from: ' + str(addr)) 
+            c[2] = 0
+            break
+      if (data == b'BYE'):  
+        for c in cl:
+          if ((c[0] == addr[0]) and (c[1] == addr[1])):
+            printlog(1, 'Removing json client ' + c[0] + ':' + str(c[1]) + ' unlinked')
+            connstr = 'BYE:' + str(addr[0]) + ':' + str(addr[1]) 
+            s.sendto(str.encode(connstr), addr)
+            cl.remove(c)
+            break
+            
+              
+    except Exception as e:
+      printlog(1, 'Error in json_recv ' + str(e))             
+                
     
 def RunServer(config):
     global filelog
@@ -542,17 +727,37 @@ def RunServer(config):
     global BLACK_LIST
     global GW_BL
     global IP_BL
-    global GW_LK
+    global GW_LK                                            
     global IP_LK
     global BLK_TMP
     global debug
+    global APRS_STR
     global lock_tx
+    global lock_nodi
+    global refl_id
+    global refl_name
+    global refl_desc
+    global aprs_en
+    global aprs_ssid
+    global SN_BL
+    global refl_contact
+    global refl_web
     
-    host = '0.0.0.0'   
+    host = config[22]   
     port = config[5]
     s = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
     s.setblocking(1)
     s.bind((host,port))
+    
+    # socket for json output
+    json_host = config[23]
+    json_port = config[24]
+    sjson = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+    sjson.setblocking(1)
+    sjson.bind((json_host,json_port))
+    
+    
+    clients_json = []
     clients = []   # addr, port, gw, t_corr, ID, lonly, t_conn, locked
     c = []
     rx_lock = []
@@ -567,8 +772,8 @@ def RunServer(config):
     BLD = []
         
     id = 1  # id gw
-    id_str = 1 # id stream
-    tx = [0, 0, '', '', '', 0, 0]  # id_gw, tout, gateway, src, dest, id_stream, start_time
+    
+    tx = [0, 0, '', '', '', 0, 0, 0.0, 0.0, 0, 0]  # id_gw, tout, gateway, src, dest, id_stream, start_time, lat, long, frm_tot, frm_ok
     
     refl_name = config[1]
     refl_desc = config[2]
@@ -591,26 +796,46 @@ def RunServer(config):
     wptttime = config[16]
     wpttcount = config[17]
     
+    aprs_en = config[18]
+    aprs_server = config[19]
+    aprs_port = config[20]
+    aprs_ssid = config[21]
+    
+    refl_contact = config[25]
+    refl_web = config[26]
+    
     recvPackets = queue.Queue()
+    
+    # queue for json messages
+    json_mess = queue.Queue()
+
+
+    gps_data = []
 
     print('Starting pYSFReflector-' + version)
-    printlog(2, 'Starting pYSFReflector-' + version)
+    printlog(4, 'Starting pYSFReflector-' + version)
     if (en_ext_cmd == 1):
       printlog(2, 'Extended Commands Enabled')
     else:
       printlog(2, 'Extended Commands Disabled')  
     threading.Thread(target=RecvData,args=(s,recvPackets)).start()
-    threading.Thread(target=ElencoNodi,args=(clients,)).start()
+    threading.Thread(target=ElencoNodi,args=(clients,json_mess)).start()
     threading.Thread(target=TimeoutNodi,args=(clients,)).start()
-    threading.Thread(target=TimeoutTX,args=(tx,rx_lock_tout,rx_lock,LH,LHD,timeout,treactivate)).start()
+    threading.Thread(target=json_recv,args=(json_mess,sjson,clients_json)).start()
+    threading.Thread(target=json_send,args=(json_mess,sjson,clients_json)).start()
+    threading.Thread(target=TimeoutNodiJS,args=(clients_json,)).start()
+    threading.Thread(target=TimeoutTX,args=(tx,rx_lock_tout,rx_lock,LH,LHD,timeout,treactivate, json_mess)).start()
     threading.Thread(target=scheduler,args=[]).start()
     if (len(f_blacklist) > 0):
       threading.Thread(target=blacklist,args=(f_blacklist,tr_blacklist,clients)).start()
+    if aprs_en:
+      threading.Thread(target=aprs_send_data,args=(aprs_server, 'YSF' + str(refl_id).zfill(5), aprs_port)).start()
     
     time_start = time.time()
     
     
     while True:
+      try:                                       # protection from errors in infinite loop
             data_ns, addr = recvPackets.get()    # blocked if queue is empty
             data = sanitize_msg(data_ns)
             cmd = data[0:4]
@@ -623,7 +848,9 @@ def RunServer(config):
               for c in clients:
                 if ((c[0] == addr[0]) and (c[1] == addr[1])):
                   pres = True
+                  lock_nodi.acquire()
                   c[3] = 0
+                  lock_nodi.release()
                   break
               if not pres:  
                 lonly = 0
@@ -653,67 +880,173 @@ def RunServer(config):
                   break
               
             if ((cmd == b'YSFD') and (len(data) == 155)):
-              [id_corr, gw_corr] = getidgw(clients, addr)
-              if (tx[0] == 0):
-                if (inlist(GW_BL, gw_corr) or inlist(GW_LK, gw_corr)):
-                  tx_ok = False
-                  block_r = 'GW'
-                else:
-                  if (inlist(IP_BL, ip2long(addr[0])) or inlist(IP_LK, ip2long(addr[0]))):
-                    tx_ok = False
-                    block_r = 'IP'      
+              # print(data)
+              lock_tx.acquire()
+              tx[9] += 1
+              lock_tx.release()
+              if ysffich.decode(data[40:]): 
+                lock_tx.acquire()
+                tx[10] += 1
+                lock_tx.release()
+                FI = ysffich.getFI()
+                FT = ysffich.getFT()
+                FN = ysffich.getFN()
+                DT = ysffich.getDT()
+                SQL = ysffich.getSQ()
+                dch = ''
+                if (FI == 0):  # header
+                  gps_data = [0] * (FT - 5) * 10
+                  gps.gps_reset()
+                  rem12 = ''
+                  rem34 = ''
+                  radio_code = 0
+                  coord_send = False
+                  hc_ok = ysfpayload.processheaderdata(data[35:])
+                  if (hc_ok == False):
+                    printlog(1, 'Error processing HC data: ' +  data[14:24].decode().strip().ljust(10) + ' at ' + data[4:14].decode().strip().ljust(10)) 
+                if ((FI == 1) and (DT == 2) and (tx[0] != 0)):
+                  dt = [0] * 10
+                  if ysfpayload.readDataVDModeData2(data[35:], dt):
+                    dch = ysfutils.list_to_string(dt)
+                    if (FN == 4):
+                      dch_s = dch.strip() 
+                      if ((len(dch_s) > 0) and (dch_s != rem12)):
+                        rem12 = dch_s
+                        printlog(1, '<' + str(tx[5]).zfill(7) + '> Additional information Rem1+2:' +  dch)
+                        json_mess.put('{"stream_id01": "' + str(tx[5]).zfill(7) + '", "Rem1+2": "' + dch + '"}')
+                    if (FN == 5):
+                      dch_s = dch.strip()
+                      if ((len(dch_s) > 0) and (dch_s != rem34)):
+                        rem34 = dch_s
+                        printlog(1, '<' + str(tx[5]).zfill(7) + '> Additional information Rem3+4:' +  dch)  
+                        json_mess.put('{"stream_id02": "' + str(tx[5]).zfill(7) + '", "Rem3+4": "' + dch + '"}')
+                    if ((FN == 6) or (FN == 7)):
+                      gps_data[(FN - 6) * 10:(FN - 5) * 10] = dt
+                      if ((FN == FT) and (len(gps_data) > 0)):
+                        # printlog(1,str(gps_data))
+                        if gps.GPS_dec(gps_data, FT):
+                          if ((gps.radio_code != 0) and (gps.radio_code != radio_code)):
+                            radio_code = gps.radio_code
+                            printlog(1, '<' + str(tx[5]).zfill(7) + '> Additional information radio code:' +  str(radio_code))
+                            json_mess.put('{"stream_id03": "' + str(tx[5]).zfill(7) + '", "radio_code": "' + str(radio_code) + '"}')
+                          if ((tx[7] == 999.0) and (gps.latitude != 999.0)):
+                            lock_tx.acquire()
+                            tx[7] = gps.latitude
+                            lock_tx.release()
+                          if ((tx[8] == 999.0) and (gps.longitude != 999.0)):
+                            lock_tx.acquire()
+                            tx[8] = gps.longitude
+                            lock_tx.release()
+                          
+                          if ((tx[7] != 999.0) and (tx[8] != 999.0) and (not coord_send)):
+                            json_mess.put('{"stream_id04": "' + str(tx[5]).zfill(7) + '", "latitude": "' + str(tx[7]) + '", "longitude": "' + str(tx[8]) + '"}')
+                            coord_send = True
+                          
+                      # print("{:.6f}".format(gps.latitude) + ' ' + "{:.6f}".format(gps.longitude))
                   else:
-                    tx_ok = canTrasmit(data[14:24].decode().strip(), CheckRE)
-                    block_r = 'CS'
-              if tx_ok:
-                if ((tx[0] == 0) and (id_corr != 0)): # new stream 
+                    dch = ''   
+                     
+                # print('DT: ' + str(ysffich.getDT()) + ' FI: ' + str(ysffich.getFI()) + ' FN/FT: ' + str(ysffich.getFN()) + '/' + str(ysffich.getFT()) + ' DCH: ' + dch)
+                [id_corr, gw_corr] = getidgw(clients, addr)
+                if (tx[0] == 0):
+                  if ((DT == 1) and ((FT == 1) or (FT == 2))):
+                    tx_ok = False
+                    block_r = 'DT'
+                  else:
+                    if (inlist(GW_BL, gw_corr) or inlist(GW_LK, gw_corr)):
+                      tx_ok = False
+                      block_r = 'GW'
+                    else:
+                      if (inlist(IP_BL, ip2long(addr[0])) or inlist(IP_LK, ip2long(addr[0]))):
+                        tx_ok = False
+                        block_r = 'IP'      
+                      else:
+                        if ((ysffich.getCM() == 1) and (len(ysfpayload.m_dest) == 10) and (ysfpayload.m_dest != '**********') and (inlist(SN_BL, ysfpayload.m_dest[5:10]))):
+                          tx_ok = False
+                          block_r = 'SN'
+                        else:
+                          tx_ok = canTrasmit(data[14:24].decode().strip(), CheckRE)
+                          block_r = 'CS'
+                if tx_ok:
+                  if ((tx[0] == 0) and (id_corr != 0) and (FI == 0) and (SQL != 127)): 
+                    lock_tx.acquire()
+                    tx[0] = id_corr
+                    tx[1] = 0
+                    # gateway
+                    tx[2] = data[4:14].decode().strip()
+                    # src
+                    tx[3] = data[14:24].decode().strip()
+                    # dest
+                    tx[4] = data[24:34].decode().strip() 
+                    # stream ID
+                    tx[5] = random.randint(0, 9999999) 
+                    # time start
+                    tx[6] = time.time()
+                    # latitude and longitude
+                    tx[7] = 999.0
+                    tx[8] = 999.0
+                    tx[9] = 1
+                    tx[10] = 1
+                    lock_tx.release() 
+                    if (not hc_ok):
+                      printlog(1, '<' + str(tx[5]).zfill(7) + '> Stream opened with invalid HC')  
+                    if ((len(ysfpayload.m_dest) == 0) or (ysfpayload.m_dest == '**********')):  
+                      dst = tx[4].ljust(10)
+                    else:
+                      dst = ysfpayload.m_dest.ljust(10) 
+                    fich_str = 'FICH-Data: CS:' + str(ysffich.getCS()) + ' | CM:' + str(ysffich.getCM()) + ' | FT:' + str(ysffich.getFT()) + ' | Dev:' + str(ysffich.getDev()) + ' | MR:' + str(ysffich.getMR()) + ' | VoIP:' + str(ysffich.getVoIP()) + ' | DT:' + str(ysffich.getDT()) + ' | SQL:' + str(ysffich.getSQL()) + ' | SQC:' + str(ysffich.getSQ()) 
+                    fich_str_json = '"CS": "' + str(ysffich.getCS()) + '", "CM": "' + str(ysffich.getCM()) + '", "FT": "' + str(ysffich.getFT()) + '", "Dev": "' + str(ysffich.getDev()) + '", "MR": "' + str(ysffich.getMR()) + '", "VoIP": "' + str(ysffich.getVoIP()) + '", "DT": "' + str(ysffich.getDT()) + '", "SQL": "' + str(ysffich.getSQL()) + '", "SQC": "' + str(ysffich.getSQ()) + '"'
+                    printlog(1, 'Received data from ' + tx[3].ljust(10) +   ' to ' +  dst + ' at ' +  tx[2].ljust(10)+ ' ' + fich_str + ' <' + str(tx[5]).zfill(7) + '>')
+                    json_mess.put('{"stream_start": "' + str(tx[5]).zfill(7) + '", "call": "' + tx[3] + '", "target": "' + dst + '", "gw": "' +  tx[2] + '", "time": "' + str(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '", ' + fich_str_json + '}')
+                    printlog(1, '<' + str(tx[5]).zfill(7) + '> Additional information dst:' +  ysfpayload.m_dest.ljust(10) + ' src:' +  ysfpayload.m_source.ljust(10) + ' uplink:' + ysfpayload.m_uplink.ljust(10) + ' downlink:' + ysfpayload.m_downlink.ljust(10))
+                    json_mess.put('{"stream_id05": "' + str(tx[5]).zfill(7) + '", "dst": "' + ysfpayload.m_dest + '", "src": "' + ysfpayload.m_source + '", "uplink": "' +  ysfpayload.m_uplink + '", "downlink": "' + ysfpayload.m_downlink + '"}')
+                    ckeck_wild_ptt(tx[3], wptttime, wpttcount, treactivate, json_mess)
+                else:
+                  if (id_corr not in rx_lock):
+                    rx_lock.append(id_corr)  
+                    inserisci_lista(BL, [check_string(data[4:14].decode().strip()) + '/' + block_r, check_string(data[14:24].decode().strip()), check_string(data[24:34].decode().strip()), -1, datetime.utcfromtimestamp(time.time()).strftime("%d-%m-%Y %H-%M-%S"), -1 ], 20)
+                    inserisci_listaD(BLD, [check_string(data[4:14].decode().strip()) + '/' + block_r, check_string(data[14:24].decode().strip()), check_string(data[24:34].decode().strip()), -1, datetime.utcfromtimestamp(time.time()).strftime("%d-%m-%Y %H-%M-%S"), -1 ], 20)
+                    printlog(1, 'Data from ' + data[14:24].decode().strip().ljust(10) + ' at ' + data[4:14].decode().strip().ljust(10) + ' blocked/' + block_r)
+                    json_mess.put('{"blocked": "-1", "CS": "' + data[14:24].decode().strip().ljust(10) + '", "GW": "' + data[4:14].decode().strip().ljust(10) + '", "BR": "' +  block_r +'", "time": "' + str(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
+                  rx_lock_tout[id_corr] = 0  
+                
+                if ((id_corr == tx[0]) and (id_corr != 0)):    
                   lock_tx.acquire()
-                  tx[0] = id_corr
                   tx[1] = 0
-                  # gateway
-                  tx[2] = data[4:14].decode().strip()
-                  # src
-                  tx[3] = data[14:24].decode().strip()
-                  # dest
-                  tx[4] = data[24:34].decode().strip() 
-                  # stream ID
-                  tx[5] = id_str
-                  # time start
-                  tx[6] = time.time()
                   lock_tx.release()
-                  id_str += 1   
-                  printlog(1, 'Received data from ' + tx[3].ljust(10) +   ' to ' +  tx[4].ljust(10) + ' at ' +  tx[2].ljust(10))
-                  ckeck_wild_ptt(tx[3], wptttime, wpttcount, treactivate)
-              else:
-                if (id_corr not in rx_lock):
-                  rx_lock.append(id_corr)  
-                  inserisci_lista(BL, [check_string(data[4:14].decode().strip()) + '/' + block_r, check_string(data[14:24].decode().strip()), check_string(data[24:34].decode().strip()), -1, datetime.utcfromtimestamp(time.time()).strftime("%d-%m-%Y %H-%M-%S"), -1 ], 20)
-                  inserisci_listaD(BLD, [check_string(data[4:14].decode().strip()) + '/' + block_r, check_string(data[14:24].decode().strip()), check_string(data[24:34].decode().strip()), -1, datetime.utcfromtimestamp(time.time()).strftime("%d-%m-%Y %H-%M-%S"), -1 ], 20)
-                  printlog(1, 'Data from ' + data[14:24].decode().strip().ljust(10) + ' at ' + data[4:14].decode().strip().ljust(10) + ' blocked/' + block_r)
-                rx_lock_tout[id_corr] = 0  
+                  
+                for c in clients:
+                  if (((c[0] != addr[0]) or (c[1] != addr[1])) and (id_corr == tx[0]) and (id_corr != 0) and (id_corr not in rx_lock) and (c[7] == 0)):
+                    try:
+                      s.sendto(data,(c[0], c[1]))
+                    except:
+                      printlog(1, 'Error sending data')        
               
-              if ((id_corr == tx[0]) and (id_corr != 0)):    
-                lock_tx.acquire()
-                tx[1] = 0
-                lock_tx.release()
-        
-              for c in clients:
-                if (((c[0] != addr[0]) or (c[1] != addr[1])) and (id_corr == tx[0]) and (id_corr != 0) and (id_corr not in rx_lock) and (c[7] == 0)):
-                  s.sendto(data,(c[0], c[1]))
-            
-              if (((data[34] & 0x01) == 0x01) and (tx[0] == id_corr) and (tx[0] !=0)):
-                printlog(1, 'Received end of transmission')
-                inserisci_lista(LH, [check_string(tx[2]), check_string(tx[3]), check_string(tx[4]), tx[5], datetime.utcfromtimestamp(tx[6]).strftime("%d-%m-%Y %H-%M-%S"), round(time.time() - tx[6]) ], 20)
-                inserisci_listaD(LHD, [check_string(tx[2]), check_string(tx[3]), check_string(tx[4]), tx[5], datetime.utcfromtimestamp(tx[6]).strftime("%d-%m-%Y %H-%M-%S"), round(time.time() - tx[6]) ], 20)
-                lock_tx.acquire()
-                tx[0] = 0
-                tx[1] = 0
-                tx[2] = ''
-                tx[3] = ''
-                tx[4] = ''
-                tx[5] = 0
-                tx[6] = 0
-                lock_tx.release()
+                if ((FI == 2) and (tx[0] == id_corr) and (tx[0] !=0)):
+                  printlog(1, 'Received end of transmission coords: ' + "{:.6f}".format(tx[7]) + ', ' + "{:.6f}".format(tx[8]) + ' | ' + str(tx[9]) + '/' + str(tx[9] - tx[10]) + ' <' + str(tx[5]).zfill(7) + '>')
+                  json_mess.put('{"stream_end": "' + str(tx[5]).zfill(7) + '", "type": "TC", "time": "' +  str(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f'))[:-3] + '"}')
+                  inserisci_lista(LH, [check_string(tx[2]), check_string(tx[3]), check_string(tx[4]), tx[5], datetime.utcfromtimestamp(tx[6]).strftime("%d-%m-%Y %H-%M-%S"), round(time.time() - tx[6]) ], 20)
+                  inserisci_listaD(LHD, [check_string(tx[2]), check_string(tx[3]), check_string(tx[4]), tx[5], datetime.utcfromtimestamp(tx[6]).strftime("%d-%m-%Y %H-%M-%S"), round(time.time() - tx[6]) ], 20)
+                  if (aprs_en and ((tx[7] != 999.0) or (tx[8] != 999.0))):
+                    s_aprs = ysfaprs.aprs_string(re.split(r'[-/]', tx[3].strip())[0], tx[7], tx[8], radio_code, str(refl_id).zfill(5), aprs_ssid)
+                    if (len(s_aprs) > 5):
+                      APRS_STR.put(s_aprs)
+                  gps.gps_reset()
+                  lock_tx.acquire()
+                  tx[0] = 0
+                  tx[1] = 0
+                  tx[2] = ''
+                  tx[3] = ''
+                  tx[4] = ''
+                  tx[5] = 0
+                  tx[6] = 0
+                  tx[7] = 999.0
+                  tx[8] = 999.0
+                  tx[9] = 0
+                  tx[10] = 0
+                  lock_tx.release()
+              else:
+                printlog(1, 'Error decoding FICH')    
                   
             if (cmd == b'YSFS'):
               printlog(0, 'YSF server status enquiry from ' + addr[0] + ':' + str(addr[1]))
@@ -746,7 +1079,7 @@ def RunServer(config):
                 printlog(0, 'Received command ' + cmd.decode() + ' from: ' + addr[0] + ':' + str(addr[1]))
                 info = 'ASRI;' + str(refl_id) + ':' + refl_name + ':' + refl_desc + ':' + 'pYSFReflector' + ':' + version + ':' + str(CheckRE) + ':' + str(timeout) + ':' + str(treactivate) + ':' + str(wptttime) + ':' + str(wpttcount) + ';'
                 s.sendto(str.encode(info),addr) 
-            
+          
               if (cmd == b'QGWL'):
                 printlog(0, 'Received command ' + cmd.decode() + ' from: ' + addr[0] + ':' + str(addr[1]))
                 info = 'AGWL;' + lista_gw(clients) 
@@ -812,7 +1145,8 @@ def RunServer(config):
                 info += s_info   
                
                 s.sendto(str.encode(info),addr)                     
-            
+      except Exception as e:
+        printlog(1, 'Infinite loop error: ' + str(e))        
                                 
     s.close()
 
@@ -870,7 +1204,7 @@ def hex_dump(data):
 
 ######## main ########
 
-version = '20210606'
+version = '20210923'
 
 if (len(sys.argv) != 2):
   print('Invalid Number of Arguments')
@@ -885,8 +1219,8 @@ if (sys.argv[1].strip() == '-v'):
 config=[]
 try:
   ReadConfig(sys.argv[1].strip(), config)
-except:
-  print('Unable to read configuration file')
+except Exception as e:
+  print('Unable to read configuration file: ' + str(e))
   sys.exit()
   
 log_basename = config[3] + '/' + config[4]
@@ -905,8 +1239,8 @@ try:
     filelog = open(log_file,'a')
   else:
     filelog = open(log_file,'x')
-except:
-  print('Unable to Open Log File')
+except Exception as e:
+  print('Unable to Open Log File: ' + str(e))
   sys.exit()
   
 BLACK_LIST = [] 
@@ -918,7 +1252,11 @@ IP_LK = []
 BLK_TMP = []
 SCHED = []
 W_PTT = []
+SUF_BL = []
+SN_BL = []
+APRS_STR = queue.Queue()
 lock_tx = threading.Lock()
+lock_nodi = threading.Lock()
 RunServer(config)
 
   

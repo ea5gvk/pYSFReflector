@@ -1,19 +1,15 @@
-##########################
-## Example of blocklist ##
-##########################
-## Block callsign
-# CS:IU5JAE  
-# IU5JAE
-## Block gateway
-## listen only
-# GW:TESTBDG
-## Two way mute
-# GWB:TESTBDG
-## Block IP
-## listen only
-# IP:80.181.214.194
-## Two way mute 
-# IPB:80.181.214.194
-## Allowed callsign
-AL:N0CALL
+#CS:IW5ELP  
+#GW:BM_2222
+#GW : TESTBDG
+#GWB : IU5JAE
+#IPB:82.61.67.101
+#IP:80.181.214.194
+#AL:OK8GG
+#AL:IW5ELP
+SB:RPT
+SB:ND
+SB:GW
+# s/n ft70
+#SN:H5JPP
+
 

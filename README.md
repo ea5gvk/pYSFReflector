@@ -89,4 +89,8 @@ actually the FileLevel-Logging is done in 3 variant loglevels: 0 to 2. Here is a
 * Level 0: All from level 1 and 2 plus some additional information about remote-commands not needed in regular situations. This level shows the full log.
 
 
-
+Example operational: http://ysf.grupporadiofirenze.net:12001/
+  
+Se debe de ejecutar ./YSFReflector pysfreflector.ini
+y tambien ./collector.py > collector.log &
+  

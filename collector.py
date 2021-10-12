@@ -38,7 +38,7 @@ from starlette.responses import HTMLResponse
 srv_addr_port = ('127.0.0.1', 42396) # 127.0.0.1
 
 # set your dashboard address and port for external
-dashb_addr_port = ('ysf.grupporadiofirenze.net', 12001) # ysf.grupporadiofirenze.net
+dashb_addr_port = ('PONER VUESTRA WEB O DNS EXTERNA', 12001) # ysf.grupporadiofirenze.net
 
 # set web server listener interface
 ws_linterface = "0.0.0.0"
